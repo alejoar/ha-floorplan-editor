@@ -237,7 +237,21 @@ function slugFromEntity(value) {
     .trim()
     .toLowerCase();
 
-  return raw.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").replace(/_+/g, "_") || "new_entity";
+  return safeBase(raw.replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").replace(/_+/g, "_") || "new_entity");
+}
+
+// Ensure a base produces valid CSS identifiers for the generated SVG element
+// ids (e.g. `${base}_lit`). HA entity ids can start with a digit (e.g.
+// `light.0xa4c...`), but a CSS id selector like `#0xa4c..._lit` is invalid, so
+// ha-floorplan's querySelectorAll throws and state_action silently dies.
+function safeBase(value) {
+  let base = String(value == null ? "" : value)
+    .trim()
+    .replace(/[^A-Za-z0-9_-]+/g, "_")
+    .replace(/^[-_]+|[-_]+$/g, "");
+  if (!base) return "entity";
+  if (!/^[A-Za-z]/.test(base)) base = "e" + base;
+  return base;
 }
 
 function titleFromSlug(slug) {
@@ -696,7 +710,8 @@ function cleanManagedNodes(root, defs) {
   });
 }
 
-function generateSvg({ originalSvg, items, viewBox, settings }) {
+function generateSvg({ originalSvg, items: rawItems, viewBox, settings }) {
+  const items = rawItems.map((item) => ({ ...item, base: safeBase(item.base) }));
   const width = viewBox.width || DEFAULT_VIEWBOX.width;
   const height = viewBox.height || DEFAULT_VIEWBOX.height;
   const parser = new DOMParser();
@@ -781,12 +796,21 @@ function generateSvg({ originalSvg, items, viewBox, settings }) {
       group.appendChild(makeSvgElement(doc, "rect", { id: item.base + "_click", class: hitboxClass, x: formatNumber(x), y: formatNumber(y), width: formatNumber(item.width), height: formatNumber(item.height), rx: 18, ry: 18 }));
 
       if (item.kind === "sensor") {
-        appendIconPath(doc, group, item.cx, item.cy - 15, item.sensorIdleIcon || item.icon || "mdi:access-point", item.sensorIdleColor || "#FFFFFF", item.base + "_icon_idle", item.customIconSvg || "");
-        appendIconPath(doc, group, item.cx, item.cy - 15, item.sensorActiveIcon || item.icon || "mdi:access-point", item.sensorActiveColor || "#FACC15", item.base + "_icon_active", item.customIconSvg || "");
+        const isTemp = item.sensorType === "temperature";
+        const iconY = isTemp ? item.cy - 20 : item.cy - 15;
+        appendIconPath(doc, group, item.cx, iconY, item.sensorIdleIcon || item.icon || "mdi:access-point", item.sensorIdleColor || "#FFFFFF", item.base + "_icon_idle", item.customIconSvg || "");
+        appendIconPath(doc, group, item.cx, iconY, item.sensorActiveIcon || item.icon || "mdi:access-point", item.sensorActiveColor || "#FACC15", item.base + "_icon_active", item.customIconSvg || "");
+        if (isTemp) {
+          // Temperature on the primary line, HVAC action on a smaller second line.
+          appendText(doc, group, { id: item.base + "_status", class: "entity-status-text", x: formatNumber(item.cx), y: formatNumber(item.cy + 16) }, idleText);
+          appendText(doc, group, { id: item.base + "_status_sub", class: "entity-status-text", style: "font-size:12px;font-weight:680;letter-spacing:0.04em;fill:rgba(247,250,255,0.82);", x: formatNumber(item.cx), y: formatNumber(item.cy + 36) }, "");
+        } else {
+          appendText(doc, group, { id: item.base + "_status", class: "entity-status-text", x: formatNumber(item.cx), y: formatNumber(item.cy + 22) }, idleText);
+        }
       } else {
         appendIconPath(doc, group, item.cx, item.cy - 15, item.kind === "camera" ? "mdi:cctv" : item.icon || "mdi:help-circle-outline", "#FFFFFF", item.base + "_icon", item.customIconSvg || "");
+        appendText(doc, group, { id: item.base + "_status", class: "entity-status-text", x: formatNumber(item.cx), y: formatNumber(item.cy + 22) }, idleText);
       }
-      appendText(doc, group, { id: item.base + "_status", class: "entity-status-text", x: formatNumber(item.cx), y: formatNumber(item.cy + 22) }, idleText);
     }
 
     root.appendChild(group);
@@ -926,14 +950,28 @@ function yamlFunctions() {
         if (!entity || entity.state === undefined || entity.state === null) return 'UNK';
         if (entity.state === 'unavailable') return 'UNAV';
         if (entity.state === 'unknown') return 'UNK';
-        var state = String(entity.state);
-        var numberValue = Number(state);
-        var display = isNaN(numberValue) ? state : String(Math.round(numberValue * 10) / 10);
         var attributes = entity.attributes || {};
+        var numberValue = Number(entity.state);
+        // climate.* entities report the HVAC mode (cool/off/heat) as their state;
+        // the measured room temperature lives in attributes.current_temperature.
+        if (isNaN(numberValue)) {
+          var current = attributes.current_temperature;
+          if (current === undefined || current === null || current === '') current = attributes.temperature;
+          if (current !== undefined && current !== null && current !== '') numberValue = Number(current);
+        }
+        var display = isNaN(numberValue) ? String(entity.state) : String(Math.round(numberValue * 10) / 10);
         var unit = unitOverride || attributes.unit_of_measurement || attributes.unit || '';
         if (unit === 'F') unit = '°F';
         if (unit === 'C') unit = '°C';
         return unit ? display + (String(unit).charAt(0) === '°' ? '' : ' ') + unit : display;
+      },
+      climateActionText: function(entity) {
+        if (!entity) return '';
+        var attributes = entity.attributes || {};
+        // climate.* exposes what it is actively doing via hvac_action; fall back
+        // to the mode (state) when hvac_action is missing. Only show active work.
+        var action = attributes.hvac_action || { cool: 'cooling', heat: 'heating', fan_only: 'fan', dry: 'drying', heat_cool: 'cooling' }[String(entity.state)] || '';
+        return { cooling: 'Cooling', heating: 'Heating', fan: 'Fan', drying: 'Drying', preheating: 'Heating', defrosting: 'Defrost' }[String(action).toLowerCase()] || '';
       },
       cameraText: function(entity) {
         if (!entity || !entity.state) return 'CAM';
@@ -988,6 +1026,14 @@ function sensorRule(item) {
   const statusText = isTemperature
     ? `${open}functions.temperatureText(entity, '${item.unit || ""}')}`
     : `${open}functions.sensorTextLabel.call(functions, entity, '${item.sensorTriggeredValue || "on"}', '${item.sensorIdleText || "Closed"}', '${item.sensorActiveText || "Open"}')}`;
+  const subStatusAction = isTemperature
+    ? `
+        - action: call-service
+          service: floorplan.text_set
+          service_data:
+            element: ${item.base}_status_sub
+            text: ${open}functions.climateActionText(entity)}`
+    : "";
   return `    - entity: ${item.entity}
       element: ${item.base}_control
       tap_action:
@@ -1018,7 +1064,7 @@ function sensorRule(item) {
           service: floorplan.text_set
           service_data:
             element: ${item.base}_status
-            text: ${statusText}`;
+            text: ${statusText}${subStatusAction}`;
 }
 
 function cameraRule(item) {
@@ -1061,7 +1107,8 @@ function genericRule(item) {
             text: ${open}functions.sensorTextLabel(entity, 'on', 'Ready', 'On')}`;
 }
 
-function generateYaml({ items, settings }) {
+function generateYaml({ items: rawItems, settings }) {
+  const items = rawItems.map((item) => ({ ...item, base: safeBase(item.base) }));
   const rules = items
     .map((item) => item.kind === "light" ? lightRule(item) : item.kind === "camera" ? cameraRule(item) : item.kind === "sensor" ? sensorRule(item) : genericRule(item))
     .join("\n");
@@ -1115,6 +1162,16 @@ function readFileAsDataUrl(file) {
   });
 }
 
+function readImageSize(src) {
+  return new Promise((resolve) => {
+    if (!src || typeof Image === "undefined") return resolve(null);
+    const img = new Image();
+    img.onload = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+    img.onerror = () => resolve(null);
+    img.src = src;
+  });
+}
+
 function downloadText(filename, text) {
   const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
   const url = URL.createObjectURL(blob);
@@ -1147,6 +1204,13 @@ function runSelfTests() {
     assert(kindFromEntity("binary_sensor.a") === "sensor", "binary sensor failed");
     assert(kindFromEntity("camera.a") === "camera", "camera failed");
     assert(kindFromEntity("switch.a") === "entity", "generic failed");
+  });
+
+  test("safeBase yields valid CSS identifiers", () => {
+    assert(safeBase("door_lamp_switch") === "door_lamp_switch", "plain slug changed");
+    assert(/^[A-Za-z]/.test(safeBase("0xa4c1388507dab669")), "digit-leading base not fixed");
+    assert(/^[A-Za-z]/.test(slugFromEntity("light.0xa4c1388507dab669")), "digit-leading entity slug not fixed");
+    assert(safeBase("") === "entity", "empty base fallback failed");
   });
 
   test("MDI icon helpers return paths", () => {
@@ -2019,6 +2083,14 @@ export default function FloorplanEntityEditor() {
       }
     }
 
+    if (!nextSvg && images.length) {
+      const primary = images.find((image) => image.role === "off") || images.find((image) => image.role === "on") || images[0];
+      const size = await readImageSize(primary?.data);
+      if (size && size.width && size.height) {
+        nextSvg = createEmptySvg(size.width, size.height);
+      }
+    }
+
     const parsed = parseItems(nextSvg);
     setPendingImport({ mode: "package", svgText: nextSvg, cssText: nextCss, images, parsed, keepExisting: false });
     setImportOpen(true);
@@ -2059,7 +2131,10 @@ export default function FloorplanEntityEditor() {
 
   function changeEntity(value) {
     if (!selected) return;
-    const kind = kindFromEntity(value);
+    // Keep the user's chosen entity type. The type dropdown is the source of
+    // truth, so editing the entity ID must not override it (e.g. a light driven
+    // by a switch.* entity should stay a light).
+    const kind = selected.kind;
     const base = slugFromEntity(value);
     if (kind === "sensor") {
       const sensorType = inferSensorType(base, "", value, base);
